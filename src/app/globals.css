@@ -45,9 +45,30 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+  /* Custom element/card radius tokens used by preetsuthar components */
+  --radius-ele: 6px;
+  --radius-card: 10px;
 }
 
 :root {
+  /* hu- variables used by preetsuthar components (HSL format for inline styles) */
+  --hu-border: 0, 0%, 92%;
+  --hu-input: 0, 0%, 100%;
+  --hu-background: 0, 0%, 100%;
+  --hu-foreground: 0, 0%, 14%;
+  --hu-card: 0, 0%, 99%;
+  --hu-card-foreground: 0, 0%, 14%;
+  --hu-primary: 235, 100%, 60%;
+  --hu-primary-foreground: 0, 0%, 98%;
+  --hu-secondary: 0, 0%, 97%;
+  --hu-secondary-foreground: 0, 0%, 20%;
+  --hu-muted: 0, 0%, 97%;
+  --hu-muted-foreground: 0, 0%, 56%;
+  --hu-accent: 0, 0%, 96%;
+  --hu-accent-foreground: 0, 0%, 20%;
+  --hu-destructive: 9, 96%, 47%;
+  --hu-destructive-foreground: 0, 0%, 98%;
+  --hu-ring: 0, 0%, 71%;
   --background: oklch(1 0 0);
   --foreground: oklch(0.145 0 0);
   --card: oklch(1 0 0);
@@ -83,6 +104,22 @@
 }
 
 .dark {
+  /* hu- dark mode overrides */
+  --hu-background: 0, 0%, 7%;
+  --hu-foreground: 0, 0%, 100%;
+  --hu-card: 0, 0%, 9%;
+  --hu-card-foreground: 0, 0%, 100%;
+  --hu-primary: 235, 100%, 60%;
+  --hu-secondary: 0, 0%, 15%;
+  --hu-secondary-foreground: 0, 0%, 100%;
+  --hu-muted: 0, 0%, 15%;
+  --hu-muted-foreground: 0, 0%, 71%;
+  --hu-accent: 0, 0%, 15%;
+  --hu-accent-foreground: 0, 0%, 100%;
+  --hu-destructive: 0, 84%, 50%;
+  --hu-border: 0, 0%, 100%, 10%;
+  --hu-input: 0, 0%, 100%, 5%;
+  --hu-ring: 0, 0%, 56%;
   --background: oklch(0.145 0 0);
   --foreground: oklch(0.985 0 0);
   --card: oklch(0.205 0 0);
