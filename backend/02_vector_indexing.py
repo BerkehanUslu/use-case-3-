@@ -7,6 +7,7 @@ Builds embeddings using sentence-transformers and indexes commune summaries
 so they can be retrieved via semantic similarity search.
 """
 
+import argparse
 import json
 import os
 import sys
@@ -24,8 +25,13 @@ INDEXES_DIR = BACKEND_DIR / "indexes"
 PARQUET_PATH = DATA_DIR / "dvf_communes.parquet"
 FAISS_INDEX_PATH = INDEXES_DIR / "real_estate.faiss"
 META_PATH = INDEXES_DIR / "real_estate_meta.json"
+BAN_COORDS_CACHE_PATH = INDEXES_DIR / "ban_coords_cache.json"
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+
+_model_cache = None  # Reason: avoid reloading the 400 MB model on every search call
+_index_cache: tuple | None = None  # Reason: avoid re-reading FAISS index from disk on every call
+_ban_error_logged = False
 
 # ---------------------------------------------------------------------------
 # Mock data
@@ -80,8 +86,38 @@ def _load_parquet_data() -> list[dict]:
         return None
 
 
+def _offline_mode_enabled() -> bool:
+    """Return True when Hugging Face libraries should stay fully offline."""
+    return os.environ.get("HF_HUB_OFFLINE") == "1" or os.environ.get("TRANSFORMERS_OFFLINE") == "1"
+
+
+def _normalise_commune_code(code: object) -> str:
+    """Return a BAN-friendly 5-digit commune code when possible."""
+    if code is None:
+        return ""
+    raw = str(code).strip()
+    if not raw or raw.lower() == "nan":
+        return ""
+    if raw.isdigit():
+        return raw.zfill(5)
+    return raw
+
+
+def _ban_citycode(code: object) -> str:
+    """Return a BAN citycode only when the source value is already a full INSEE code."""
+    if code is None:
+        return ""
+    raw = str(code).strip()
+    if raw.isdigit() and len(raw) == 5:
+        return raw
+    return ""
+
+
 def _get_model():
     """Load (and cache) the sentence-transformer model."""
+    global _model_cache
+    if _model_cache is not None:
+        return _model_cache
     try:
         from sentence_transformers import SentenceTransformer  # type: ignore
     except ImportError:
@@ -90,8 +126,13 @@ def _get_model():
             "Install it with:  pip install sentence-transformers"
         )
         sys.exit(1)
-    print(f"[info] Loading model: {MODEL_NAME}")
-    return SentenceTransformer(MODEL_NAME)
+    offline = _offline_mode_enabled()
+    if offline:
+        print(f"[info] Loading model in offline mode: {MODEL_NAME}")
+    else:
+        print(f"[info] Loading model: {MODEL_NAME}")
+    _model_cache = SentenceTransformer(MODEL_NAME, local_files_only=offline)
+    return _model_cache
 
 
 def _get_faiss():
@@ -107,11 +148,164 @@ def _get_faiss():
 
 
 # ---------------------------------------------------------------------------
+# BAN (Base Adresse Nationale) geocoding
+# ---------------------------------------------------------------------------
+
+
+def _fetch_ban_coordinates(commune: str, code: str) -> tuple[float, float] | None:
+    """Fetch (lat, lon) for a single commune from the BAN API.
+
+    Uses api-adresse.data.gouv.fr — free, no auth required.
+    Returns None on any network/parse error so callers can degrade gracefully.
+    """
+    global _ban_error_logged
+    try:
+        import certifi
+        import socket
+        import ssl
+        import time
+        import urllib.error
+        import urllib.parse
+        import urllib.request
+
+        params = urllib.parse.urlencode({"q": commune, "type": "municipality", "limit": "1"})
+        citycode = _ban_citycode(code)
+        if citycode and citycode != "00000":
+            params += f"&citycode={citycode}"
+        url = f"https://api-adresse.data.gouv.fr/search/?{params}"
+        req = urllib.request.Request(url, headers={"User-Agent": "use-case-3-real-estate-assistant/1.0"})
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        for attempt in range(3):
+            try:
+                with urllib.request.urlopen(req, timeout=5, context=ssl_context) as resp:
+                    payload = json.loads(resp.read().decode())
+                features = payload.get("features", [])
+                if features:
+                    lon, lat = features[0]["geometry"]["coordinates"]
+                    return float(lat), float(lon)
+                return None
+            except urllib.error.HTTPError as exc:
+                if exc.code not in (429, 500, 502, 503, 504) or attempt == 2:
+                    raise
+            except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+                if attempt == 2:
+                    raise exc
+            time.sleep(0.5 * (attempt + 1))
+    except Exception as exc:
+        if not _ban_error_logged:
+            print(f"[warn] BAN lookup failed for '{commune}' ({code}): {exc}")
+            _ban_error_logged = True
+    return None
+
+
+def _geocode_communes(data: list[dict], *, retry_empty_cache: bool = True) -> dict[str, tuple[float, float]]:
+    """Geocode unique communes using BAN API, persisting results in a local cache.
+
+    Returns a dict mapping commune name → (lat, lon).
+    Communes that cannot be geocoded are absent from the result.
+    """
+    import time
+
+    # Load existing cache from disk
+    cache: dict[str, list[float]] = {}
+    if BAN_COORDS_CACHE_PATH.exists():
+        try:
+            cache = json.loads(BAN_COORDS_CACHE_PATH.read_text(encoding="utf-8"))
+        except Exception:
+            cache = {}
+
+    # Identify unique communes not yet cached. Optionally retry stale empty values,
+    # which usually come from a previous offline / network-failed run.
+    to_fetch: dict[str, str] = {}  # commune → code
+    for row in data:
+        commune = str(row.get("commune") or row.get("nom_commune", "")).strip()
+        code = _normalise_commune_code(row.get("code") or row.get("code_commune", ""))
+        cached = cache.get(commune)
+        should_fetch = commune and (
+            commune not in cache or (retry_empty_cache and (not cached or len(cached) != 2))
+        )
+        if should_fetch and commune not in to_fetch:
+            to_fetch[commune] = code
+
+    if to_fetch:
+        print(f"[info] Fetching BAN coordinates for {len(to_fetch)} new commune(s)…")
+        failures = 0
+        for i, (commune, code) in enumerate(to_fetch.items(), 1):
+            coords = _fetch_ban_coordinates(commune, code)
+            cache[commune] = list(coords) if coords else []
+            if coords is None:
+                failures += 1
+            if i % 50 == 0:
+                print(f"  … {i}/{len(to_fetch)} done")
+            if i % 500 == 0:
+                INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+                BAN_COORDS_CACHE_PATH.write_text(
+                    json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+                )
+            time.sleep(0.05)  # Reason: polite rate-limit — 20 req/s max
+
+        INDEXES_DIR.mkdir(parents=True, exist_ok=True)
+        BAN_COORDS_CACHE_PATH.write_text(
+            json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        geocoded = sum(1 for v in cache.values() if v)
+        print(f"[info] BAN geocoding done: {geocoded}/{len(cache)} communes with coordinates")
+        if failures:
+            print(f"[warn] BAN geocoding failed for {failures}/{len(to_fetch)} requested communes.")
+    else:
+        print(f"[info] BAN cache up-to-date ({len(cache)} communes).")
+
+    return {k: (v[0], v[1]) for k, v in cache.items() if v}
+
+
+def _attach_coordinates_to_metadata(
+    metadata: list[dict],
+    coords_cache: dict[str, tuple[float, float]],
+) -> list[dict]:
+    """Return metadata rows with lat/lon refreshed from the BAN cache."""
+    updated: list[dict] = []
+    with_coords = 0
+    for row in metadata:
+        entry = dict(row)
+        coords = coords_cache.get(str(entry.get("commune", "")).strip())
+        if coords:
+            entry["lat"], entry["lon"] = coords
+            with_coords += 1
+        else:
+            entry["lat"] = None
+            entry["lon"] = None
+        updated.append(entry)
+    print(f"[info] Metadata coordinate refresh: {with_coords}/{len(updated)} rows now have lat/lon.")
+    return updated
+
+
+def refresh_metadata_coordinates(*, retry_empty_cache: bool = True) -> int:
+    """Refresh lat/lon in existing metadata without rebuilding embeddings."""
+    if not META_PATH.exists():
+        raise FileNotFoundError(
+            f"Metadata file not found at {META_PATH}. Build the index once before refreshing coordinates."
+        )
+
+    metadata = json.loads(META_PATH.read_text(encoding="utf-8"))
+    coords_cache = _geocode_communes(metadata, retry_empty_cache=retry_empty_cache)
+    updated = _attach_coordinates_to_metadata(metadata, coords_cache)
+    META_PATH.write_text(json.dumps(updated, ensure_ascii=False, indent=2), encoding="utf-8")
+    geocoded = sum(1 for row in updated if row.get("lat") is not None and row.get("lon") is not None)
+    print(f"[info] Metadata saved to {META_PATH}")
+    return geocoded
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
 
-def build_index(data: list[dict] | None = None) -> None:
+def build_index(
+    data: list[dict] | None = None,
+    *,
+    skip_geocoding: bool = False,
+    retry_empty_cache: bool = True,
+) -> None:
     """Build and save FAISS index from data or mock data.
 
     Parameters
@@ -131,6 +325,13 @@ def build_index(data: list[dict] | None = None) -> None:
             print("[info] Using built-in mock data for 10 French communes.")
             data = MOCK_COMMUNES
 
+    # ---- geocode communes via BAN API (results cached to disk) -------------
+    coords_cache = {}
+    if skip_geocoding:
+        print("[info] Skipping BAN geocoding; metadata lat/lon will remain empty.")
+    else:
+        coords_cache = _geocode_communes(data, retry_empty_cache=retry_empty_cache)
+
     # ---- build metadata records & texts ------------------------------------
     metadata: list[dict] = []
     texts: list[str] = []
@@ -138,7 +339,7 @@ def build_index(data: list[dict] | None = None) -> None:
     for idx, row in enumerate(data):
         # normalise key names that might differ in real parquet
         commune = row.get("commune") or row.get("nom_commune", f"Commune_{idx}")
-        code = row.get("code") or row.get("code_commune", "00000")
+        code = _normalise_commune_code(row.get("code") or row.get("code_commune", "00000"))
         prix_moyen = float(row.get("prix_moyen_m2") or row.get("prix_moyen", 0.0))
         prix_median = float(row.get("prix_median_m2") or row.get("prix_median", prix_moyen))
         nb_trans = int(row.get("nb_transactions") or row.get("transactions", 0))
@@ -156,6 +357,7 @@ def build_index(data: list[dict] | None = None) -> None:
         }
         text = _build_text(normalised)
         texts.append(text)
+        coords = coords_cache.get(commune)
         metadata.append(
             {
                 "id": idx,
@@ -163,8 +365,12 @@ def build_index(data: list[dict] | None = None) -> None:
                 "code": code,
                 "text": text,
                 "prix_moyen_m2": prix_moyen,
+                "prix_median_m2": prix_median,
+                "nb_transactions": nb_trans,
                 "annee": annee,
                 "type_bien": type_bien,
+                "lat": coords[0] if coords else None,
+                "lon": coords[1] if coords else None,
             }
         )
 
@@ -201,6 +407,10 @@ def load_index() -> tuple:
         index    – faiss index object
         metadata – list of dicts
     """
+    global _index_cache
+    if _index_cache is not None:
+        return _index_cache
+
     faiss = _get_faiss()
 
     if not FAISS_INDEX_PATH.exists():
@@ -217,7 +427,8 @@ def load_index() -> tuple:
     index = faiss.read_index(str(FAISS_INDEX_PATH))
     metadata = json.loads(META_PATH.read_text())
     print(f"[info] Loaded index ({index.ntotal} vectors) and {len(metadata)} metadata records.")
-    return index, metadata
+    _index_cache = (index, metadata)
+    return _index_cache
 
 
 def search(query: str, k: int = 5) -> list[dict]:
@@ -261,15 +472,59 @@ def search(query: str, k: int = 5) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("=== Building FAISS index ===")
-    build_index()
+    parser = argparse.ArgumentParser(description="Build or refresh the real-estate FAISS index.")
+    parser.add_argument(
+        "--refresh-coords-only",
+        action="store_true",
+        help="Refresh lat/lon in existing metadata using BAN without rebuilding embeddings.",
+    )
+    parser.add_argument(
+        "--skip-geocoding",
+        action="store_true",
+        help="Build embeddings/index without calling BAN.",
+    )
+    parser.add_argument(
+        "--no-search-test",
+        action="store_true",
+        help="Skip the final example search after building the index.",
+    )
+    parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Force Hugging Face model loading to use local cache only.",
+    )
+    parser.add_argument(
+        "--keep-empty-ban-cache",
+        action="store_true",
+        help="Do not retry communes that currently have empty BAN cache entries.",
+    )
+    args = parser.parse_args()
 
-    print("\n=== Test search: 'prix immobilier Paris appartement' ===")
-    results = search("prix immobilier Paris appartement", k=5)
-    for rank, r in enumerate(results, 1):
-        print(
-            f"  [{rank}] {r['commune']} ({r['code']}) | "
-            f"score={r['score']:.4f} | "
-            f"{r['prix_moyen_m2']:,.0f} €/m² | "
-            f"{r['type_bien']} {r['annee']}"
+    if args.offline:
+        os.environ["HF_HUB_OFFLINE"] = "1"
+        os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
+    retry_empty_cache = not args.keep_empty_ban_cache
+
+    if args.refresh_coords_only:
+        print("=== Refreshing metadata coordinates ===")
+        geocoded = refresh_metadata_coordinates(retry_empty_cache=retry_empty_cache)
+        if geocoded == 0:
+            print("[warn] No coordinates were populated. Check BAN connectivity before retrying.")
+    else:
+        print("=== Building FAISS index ===")
+        build_index(
+            skip_geocoding=args.skip_geocoding,
+            retry_empty_cache=retry_empty_cache,
         )
+
+        if not args.no_search_test:
+            print("\n=== Test search: 'prix immobilier Paris appartement' ===")
+            results = search("prix immobilier Paris appartement", k=5)
+            for rank, r in enumerate(results, 1):
+                print(
+                    f"  [{rank}] {r['commune']} ({r['code']}) | "
+                    f"score={r['score']:.4f} | "
+                    f"{r['prix_moyen_m2']:,.0f} €/m² | "
+                    f"{r['type_bien']} {r['annee']}"
+                )

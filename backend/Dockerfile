@@ -13,7 +13,24 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Copy and install Python dependencies into a target prefix so we can
 # copy only the installed packages into the final image.
 COPY requirements.txt .
-RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+RUN python - <<'PY'
+from pathlib import Path
+
+lines = Path("requirements.txt").read_text().splitlines()
+filtered = [
+    line for line in lines
+    if line.strip() and not line.lstrip().startswith(("torch", "torchvision", "torchaudio", "triton"))
+]
+Path("requirements-docker.txt").write_text("\n".join(filtered) + "\n")
+Path("constraints-docker.txt").write_text("torch==2.5.1\n")
+PY
+RUN pip install --no-cache-dir --prefix=/install \
+    --index-url https://download.pytorch.org/whl/cpu \
+    --extra-index-url https://pypi.org/simple \
+    torch==2.5.1
+RUN pip install --no-cache-dir --prefix=/install \
+    -c constraints-docker.txt \
+    -r requirements-docker.txt
 
 
 # ── Stage 2: runtime ─────────────────────────────────────────────────────────
@@ -42,4 +59,4 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=15s --retries=3 \
     CMD python -c "import httpx; httpx.get('http://localhost:8000/health', timeout=5)"
 
 # Default command — override in docker-compose for other services
-CMD ["uvicorn", "02_api:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uvicorn", "06_api_deployment:app", "--host", "0.0.0.0", "--port", "8000"]

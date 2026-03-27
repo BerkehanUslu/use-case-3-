@@ -16,16 +16,31 @@ _summarizer = None
 
 
 def get_summarizer():
-    """Lazy-load and cache the summarization pipeline."""
+    """Lazy-load and cache the BARThez summarizer callable."""
     global _summarizer
     if _summarizer is None:
-        from transformers import pipeline
+        from transformers import BarthezTokenizer, MBartForConditionalGeneration
+        import torch
 
-        _summarizer = pipeline(
-            "summarization",
-            model="moussaKam/barthez-orangesum-abstract",
-            tokenizer="moussaKam/barthez-orangesum-abstract",
-        )
+        _model_name = "moussaKam/barthez-orangesum-abstract"
+        _tok = BarthezTokenizer.from_pretrained(_model_name)
+        _mdl = MBartForConditionalGeneration.from_pretrained(_model_name)
+        _mdl.training = False
+
+        def _run(text: str, max_length: int, min_length: int) -> str:
+            inputs = _tok(
+                [text], return_tensors="pt", truncation=True, max_length=1024
+            )
+            with torch.no_grad():
+                output_ids = _mdl.generate(
+                    inputs["input_ids"],
+                    num_beams=4,
+                    max_length=max_length,
+                    min_length=min_length,
+                )
+            return _tok.decode(output_ids[0], skip_special_tokens=True)
+
+        _summarizer = _run
     return _summarizer
 
 
@@ -34,16 +49,9 @@ def get_summarizer():
 # ---------------------------------------------------------------------------
 
 def _run_summarizer(text: str, max_length: int, min_length: int) -> str:
-    """Run the BARThez pipeline on a single text chunk."""
+    """Run the BARThez model on a single text chunk."""
     summarizer = get_summarizer()
-    result = summarizer(
-        text,
-        max_length=max_length,
-        min_length=min_length,
-        do_sample=False,
-        truncation=True,
-    )
-    return result[0]["summary_text"]
+    return summarizer(text, max_length=max_length, min_length=min_length)
 
 
 def _mock_summary(text: str) -> str:

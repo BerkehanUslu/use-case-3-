@@ -15,8 +15,10 @@ Works in two modes:
 import streamlit as st
 import httpx
 import json
+import os
 import plotly.graph_objects as go
 import plotly.express as px
+from pathlib import Path
 
 # ─── Page Config ────────────────────────────────────────────────────────────────
 st.set_page_config(
@@ -58,7 +60,10 @@ with st.sidebar:
 
     api_url = st.text_input(
         "URL de l'API",
-        value="http://localhost:8000",
+        value=(
+            os.getenv("API_URL")
+            or f"http://{os.getenv('API_HOST', 'localhost')}:{os.getenv('API_PORT', '8000')}"
+        ),
         help="Adresse du backend FastAPI"
     )
 
@@ -85,6 +90,8 @@ with st.sidebar:
     st.caption("CY Tech — Projet IA Immobilier 2024")
 
 API_AVAILABLE = st.session_state.api_available
+BASE_DIR = Path(__file__).resolve().parent
+META_PATH = BASE_DIR / "indexes" / "real_estate_meta.json"
 
 # ─── Helper functions ───────────────────────────────────────────────────────────
 def api_get(endpoint: str, params: dict = None):
@@ -109,6 +116,127 @@ def api_post(endpoint: str, payload: dict = None, files=None):
     except Exception as e:
         st.error(f"Erreur API : {e}")
         return None
+
+def _aggregate_reference_map_data(records: list[dict]) -> dict:
+    """Build a fast map dataset using real prices with reference coordinates.
+
+    This avoids waiting for nationwide BAN geocoding: we keep curated lat/lon for
+    the main demo cities and replace only the market statistics from real metadata.
+    """
+    aggregated: dict = {}
+    for city, ref in MOCK_COMMUNES.items():
+        city_upper = city.upper()
+        matches = [r for r in records if str(r.get("commune", "")).upper() == city_upper]
+        if not matches:
+            prefix = city_upper + " "
+            matches = [r for r in records if str(r.get("commune", "")).upper().startswith(prefix)]
+        if not matches:
+            continue
+
+        total_tx = sum(int(r.get("nb_transactions", 0) or 0) for r in matches)
+        weight = total_tx if total_tx > 0 else len(matches)
+
+        def _weighted(field: str, fallback: float = 0.0) -> float:
+            numerator = 0.0
+            for row in matches:
+                row_tx = int(row.get("nb_transactions", 0) or 0)
+                row_weight = row_tx if total_tx > 0 else 1
+                numerator += float(row.get(field, fallback) or fallback) * row_weight
+            return round(numerator / weight, 0)
+
+        aggregated[city] = {
+            "lat": ref["lat"],
+            "lon": ref["lon"],
+            "prix_moyen_m2": _weighted("prix_moyen_m2", ref["prix_moyen_m2"]),
+            "prix_median_m2": _weighted("prix_median_m2", ref["prix_median_m2"]),
+            "nb_transactions": total_tx,
+            "code": ref["code"],
+        }
+    return aggregated
+
+
+def _load_map_data() -> tuple[dict, str]:
+    """Load commune map data from metadata if available.
+
+    Returns (data, source_label), where data is a dict of commune →
+    {lat, lon, prix_moyen_m2, prix_median_m2, nb_transactions, code}.
+    """
+    try:
+        with open(META_PATH, "r", encoding="utf-8") as fh:
+            records = json.load(fh)
+
+        # Deduplicate: keep one entry per commune (highest prix_moyen_m2 row)
+        communes: dict = {}
+        for r in records:
+            name = r.get("commune", "")
+            lat = r.get("lat")
+            lon = r.get("lon")
+            if not name or lat is None or lon is None:
+                continue
+            prev = communes.get(name)
+            if prev is None or r.get("prix_moyen_m2", 0) > prev.get("prix_moyen_m2", 0):
+                communes[name] = {
+                    "lat": lat,
+                    "lon": lon,
+                    "prix_moyen_m2": r.get("prix_moyen_m2", 0),
+                    "prix_median_m2": r.get("prix_median_m2", r.get("prix_moyen_m2", 0)),
+                    "nb_transactions": r.get("nb_transactions", 0),
+                    "code": r.get("code", ""),
+                }
+
+        if communes:
+            return communes, "index FAISS"
+
+        reference_data = _aggregate_reference_map_data(records)
+        if reference_data:
+            return reference_data, "index réel + coordonnées de référence"
+    except Exception:
+        pass
+
+    # Fallback to hardcoded mock data when index is not built
+    return MOCK_COMMUNES, "données mock"
+
+
+def _load_trends_data(commune: str) -> list[dict]:
+    """Load year-over-year trend data for a commune directly from the metadata index.
+
+    Returns a list of {annee, type_bien, prix_moyen_m2, prix_median_m2, nb_transactions},
+    sorted by (annee, type_bien). Empty list if index not available or commune not found.
+    """
+    try:
+        with open(META_PATH, "r", encoding="utf-8") as fh:
+            records = json.load(fh)
+
+        commune_lower = commune.lower()
+        # Exact match first, then prefix+space to avoid false matches (e.g. PARISOT vs PARIS 01)
+        matches = [r for r in records if r.get("commune", "").lower() == commune_lower]
+        if not matches:
+            prefix = commune_lower + " "
+            matches = [r for r in records if r.get("commune", "").lower().startswith(prefix)]
+
+        # Group by (annee, type_bien)
+        from collections import defaultdict
+        buckets: dict = defaultdict(list)
+        for r in matches:
+            key = (r.get("annee"), r.get("type_bien", "Tous"))
+            buckets[key].append(r)
+
+        trends = []
+        for (annee, type_bien), rows in sorted(buckets.items()):
+            avg_prix = sum(r.get("prix_moyen_m2", 0) for r in rows) / len(rows)
+            avg_med = sum(r.get("prix_median_m2", r.get("prix_moyen_m2", 0)) for r in rows) / len(rows)
+            total_tx = sum(r.get("nb_transactions", 0) for r in rows)
+            trends.append({
+                "annee": annee,
+                "type_bien": type_bien,
+                "prix_moyen_m2": round(avg_prix, 0),
+                "prix_median_m2": round(avg_med, 0),
+                "nb_transactions": total_tx,
+            })
+        return trends
+    except Exception:
+        return []
+
 
 def price_color(prix: float) -> str:
     """Return color based on price per m²."""
@@ -145,13 +273,13 @@ with tab1:
             label_visibility="collapsed"
         )
     with col_btn:
-        search_btn = st.button("🔍 Rechercher", use_container_width=True)
+        search_btn = st.button("🔍 Rechercher", width="stretch")
 
     if search_btn and commune_query:
         commune_key = commune_query.strip().title()
 
         if API_AVAILABLE:
-            data = api_get("/prix/commune", params={"commune": commune_query})
+            data = api_get(f"/communes/{commune_query.strip()}")
         else:
             data = None
             for key, val in MOCK_COMMUNES.items():
@@ -167,24 +295,37 @@ with tab1:
                 st.info(f"Commune « {commune_key} » non trouvée dans les données de démo. Essayez : Paris, Lyon, Marseille, etc.")
 
         if data:
+            # Normalise field names: API returns avg_price_m2/transactions,
+            # mock data uses prix_moyen_m2/prix_median_m2/nb_transactions.
+            prix_moyen = data.get("prix_moyen_m2") or data.get("avg_price_m2", 0)
+            prix_median = data.get("prix_median_m2") or data.get("avg_price_m2", 0)
+            nb_trans = data.get("nb_transactions") or data.get("transactions", 0)
+            prix_reference = prix_median or prix_moyen
+
             st.markdown("---")
             st.subheader(f"Résultats pour **{data.get('commune', commune_key)}**")
 
             c1, c2, c3 = st.columns(3)
             with c1:
-                st.metric("Prix moyen (€/m²)", f"{data['prix_moyen_m2']:,.0f} €")
+                st.metric("Prix de référence (médian €/m²)", f"{prix_reference:,.0f} €")
             with c2:
-                st.metric("Prix médian (€/m²)", f"{data['prix_median_m2']:,.0f} €")
+                st.metric("Prix moyen (€/m²)", f"{prix_moyen:,.0f} €")
             with c3:
-                st.metric("Nb transactions", f"{data['nb_transactions']:,}")
+                st.metric("Nb transactions", f"{nb_trans:,}")
 
-            # Bar chart — commune vs top 5 from mock
+            if prix_median and prix_moyen and prix_moyen > prix_median * 1.35:
+                st.caption(
+                    "Le prix moyen est sensible aux valeurs extrêmes, surtout pour les "
+                    "locaux commerciaux. Le prix médian est affiché comme référence."
+                )
+
+            # Bar chart — commune vs top 5 from mock using median to reduce outlier distortion
             st.markdown("#### Comparaison avec d'autres communes")
-            top5 = sorted(MOCK_COMMUNES.items(), key=lambda x: x[1]["prix_moyen_m2"], reverse=True)[:5]
-            chart_data = {c: v["prix_moyen_m2"] for c, v in top5}
+            top5 = sorted(MOCK_COMMUNES.items(), key=lambda x: x[1]["prix_median_m2"], reverse=True)[:5]
+            chart_data = {c: v["prix_median_m2"] for c, v in top5}
             # Add searched commune if not already there
             if commune_key not in chart_data:
-                chart_data[commune_key] = data["prix_moyen_m2"]
+                chart_data[commune_key] = prix_reference
 
             communes_list = list(chart_data.keys())
             prices_list = list(chart_data.values())
@@ -203,14 +344,63 @@ with tab1:
                 )
             )
             fig.update_layout(
-                title="Prix moyen au m² (€)",
+                title="Prix médian au m² (€)",
                 xaxis_title="Commune",
                 yaxis_title="€/m²",
                 plot_bgcolor="rgba(0,0,0,0)",
                 paper_bgcolor="rgba(0,0,0,0)",
                 height=400,
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width="stretch")
+
+            # Time-series trend chart
+            st.markdown("#### Évolution des prix par année")
+            if API_AVAILABLE:
+                trend_data = api_get(f"/trends/{commune_query.strip()}")
+                trend_rows = trend_data.get("trends", []) if trend_data else []
+            else:
+                # Read directly from index when API is off
+                trend_rows = _load_trends_data(commune_key)
+
+            if trend_rows:
+                # Group rows by type_bien for separate lines
+                from collections import defaultdict
+                by_type: dict = defaultdict(list)
+                for row in trend_rows:
+                    by_type[row["type_bien"]].append(row)
+
+                fig_trend = go.Figure()
+                for type_bien, rows in sorted(by_type.items()):
+                    rows_sorted = sorted(rows, key=lambda r: r["annee"])
+                    fig_trend.add_trace(go.Scatter(
+                        x=[str(r["annee"]) for r in rows_sorted],
+                        y=[
+                            r.get("prix_median_m2", r.get("prix_moyen_m2", 0))
+                            for r in rows_sorted
+                        ],
+                        mode="lines+markers",
+                        name=type_bien,
+                        hovertemplate=(
+                            "%{x}<br>%{y:,.0f} €/m²<extra>" + type_bien + "</extra>"
+                        ),
+                    ))
+
+                fig_trend.update_layout(
+                    title=f"Tendance des prix médians — {data.get('commune', commune_key)}",
+                    xaxis_title="Année",
+                    yaxis_title="Prix médian (€/m²)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    height=380,
+                    legend_title="Type de bien",
+                    xaxis={"type": "category"},
+                )
+                st.plotly_chart(fig_trend, width="stretch")
+            else:
+                st.info(
+                    "Données de tendance non disponibles — construisez l'index d'abord "
+                    "(`python 02_vector_indexing.py`)."
+                )
 
     elif search_btn:
         st.warning("Veuillez saisir un nom de commune.")
@@ -235,7 +425,7 @@ with tab2:
             height=150,
         )
 
-    qa_btn = st.button("📨 Soumettre la question", use_container_width=False)
+    qa_btn = st.button("📨 Soumettre la question", width="content")
 
     if qa_btn:
         if not question.strip():
@@ -246,7 +436,7 @@ with tab2:
                     payload = {"question": question}
                     if context_text.strip():
                         payload["context"] = context_text
-                    result = api_post("/qa/answer", payload)
+                    result = api_post("/qa", payload)
                 else:
                     # Demo mock answer
                     result = {
@@ -268,7 +458,7 @@ with tab2:
                 st.markdown("#### Réponse")
                 st.markdown(f"**{result.get('answer', 'Aucune réponse disponible.')}**")
 
-                confidence = result.get("confidence", 0.0)
+                confidence = result.get("score") or result.get("confidence", 0.0)
                 st.markdown(f"**Score de confiance : {confidence:.0%}**")
                 st.progress(float(confidence))
 
@@ -304,7 +494,7 @@ with tab3:
             value=150,
             step=10,
         )
-        sum_btn_text = st.button("✂️ Générer le résumé (texte)", use_container_width=False)
+        sum_btn_text = st.button("✂️ Générer le résumé (texte)", width="content")
 
         if sum_btn_text:
             if not report_text.strip():
@@ -312,7 +502,7 @@ with tab3:
             else:
                 with st.spinner("Génération du résumé…"):
                     if API_AVAILABLE:
-                        result = api_post("/summarize/text", {
+                        result = api_post("/summarize", {
                             "text": report_text,
                             "max_length": max_length,
                         })
@@ -363,7 +553,7 @@ with tab3:
             step=10,
             key="pdf_max_length",
         )
-        sum_btn_pdf = st.button("✂️ Générer le résumé (PDF)", use_container_width=False)
+        sum_btn_pdf = st.button("✂️ Générer le résumé (PDF)", width="content")
 
         if sum_btn_pdf:
             if uploaded_pdf is None:
@@ -373,7 +563,7 @@ with tab3:
                 with st.spinner("Analyse du PDF en cours…"):
                     if API_AVAILABLE:
                         result = api_post(
-                            "/summarize/pdf",
+                            "/summarize-pdf",
                             files={"file": (uploaded_pdf.name, pdf_bytes, "application/pdf")},
                         )
                     else:
@@ -428,7 +618,7 @@ with tab4:
         height=200,
     )
 
-    analyze_btn = st.button("🧠 Analyser le bien", use_container_width=False)
+    analyze_btn = st.button("🧠 Analyser le bien", width="content")
 
     SENTIMENT_EMOJI = {
         "très positif": "⭐⭐⭐⭐⭐",
@@ -460,7 +650,7 @@ with tab4:
         else:
             with st.spinner("Analyse en cours…"):
                 if API_AVAILABLE:
-                    result = api_post("/analyze/sentiment", {"text": property_desc})
+                    result = api_post("/sentiment", {"text": property_desc})
                 else:
                     # Demo: simple heuristic based on positive/negative keywords
                     positive_words = [
@@ -558,7 +748,7 @@ with tab4:
                     title={"text": "Score de positivité"},
                 ))
                 fig_gauge.update_layout(height=300, margin=dict(t=50, b=0, l=30, r=30))
-                st.plotly_chart(fig_gauge, use_container_width=True)
+                st.plotly_chart(fig_gauge, width="stretch")
 
 # ════════════════════════════════════════════════════════════════════════════════
 # TAB 5 — Carte Interactive
@@ -572,8 +762,11 @@ with tab5:
         import folium
         from streamlit_folium import st_folium
 
+        map_communes, source_label = _load_map_data()
+        st.caption(f"Source : {source_label} — {len(map_communes)} communes")
+
         # Color scale: green (cheap) → red (expensive)
-        prices = [v["prix_moyen_m2"] for v in MOCK_COMMUNES.values()]
+        prices = [v["prix_moyen_m2"] for v in map_communes.values()]
         min_price = min(prices)
         max_price = max(prices)
 
@@ -591,7 +784,7 @@ with tab5:
 
         m = folium.Map(location=[46.5, 2.5], zoom_start=6, tiles="CartoDB positron")
 
-        for commune, data in MOCK_COMMUNES.items():
+        for commune, data in map_communes.items():
             color = price_to_color(data["prix_moyen_m2"])
             radius = price_to_radius(data["prix_moyen_m2"])
             tooltip = (
@@ -633,6 +826,7 @@ with tab5:
         )
         import pandas as pd
 
+        map_communes, _ = _load_map_data()
         map_df = pd.DataFrame([
             {
                 "lat": v["lat"],
@@ -640,7 +834,7 @@ with tab5:
                 "commune": k,
                 "prix_moyen_m2": v["prix_moyen_m2"],
             }
-            for k, v in MOCK_COMMUNES.items()
+            for k, v in map_communes.items()
         ])
         st.map(map_df[["lat", "lon"]], zoom=5)
 
@@ -649,12 +843,13 @@ with tab5:
         display_df = map_df[["commune", "prix_moyen_m2"]].copy()
         display_df.columns = ["Commune", "Prix moyen (€/m²)"]
         display_df = display_df.sort_values("Prix moyen (€/m²)", ascending=False)
-        st.dataframe(display_df, use_container_width=True, hide_index=True)
+        st.dataframe(display_df, width="stretch", hide_index=True)
 
     # Price comparison bar chart at the bottom
     st.markdown("---")
     st.markdown("#### Comparatif des prix par commune")
-    sorted_communes = sorted(MOCK_COMMUNES.items(), key=lambda x: x[1]["prix_moyen_m2"], reverse=True)
+    _bar_communes, _ = _load_map_data()
+    sorted_communes = sorted(_bar_communes.items(), key=lambda x: x[1]["prix_moyen_m2"], reverse=True)
     commune_names = [c for c, _ in sorted_communes]
     commune_prices = [v["prix_moyen_m2"] for _, v in sorted_communes]
     bar_colors = [price_to_color(p) if "price_to_color" in dir() else "#457b9d" for p in commune_prices]
@@ -675,4 +870,4 @@ with tab5:
         paper_bgcolor="rgba(0,0,0,0)",
         height=380,
     )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width="stretch")

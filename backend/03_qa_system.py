@@ -87,12 +87,17 @@ def get_qa_pipeline():
         return _qa_pipeline
 
     try:
-        from transformers import pipeline  # type: ignore
+        from transformers import pipeline, AutoTokenizer  # type: ignore
 
         print("Chargement du modèle CamemBERT QA (peut prendre quelques instants)...")
+        _model_name = "etalab-ia/camembert-base-squadFR-fquad-piaf"
+        # Reason: CamemBERT uses SentencePiece — use_fast=False avoids tokenizer
+        # resolution failures in newer transformers versions.
+        tokenizer = AutoTokenizer.from_pretrained(_model_name, use_fast=False)
         _qa_pipeline = pipeline(
             "question-answering",
-            model="etalab-ia/camembert-base-squadFR-fquad-piaf",
+            model=_model_name,
+            tokenizer=tokenizer,
         )
         print("Modèle chargé avec succès.")
     except Exception as exc:  # pragma: no cover

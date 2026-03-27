@@ -14,7 +14,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 import json
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+import tempfile
+
+from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -264,17 +266,129 @@ def list_communes():
 
 @app.get("/communes/{commune}")
 def get_commune(commune: str):
-    """Return statistics for a specific commune (case-insensitive)."""
+    """Return aggregated statistics for a commune (case-insensitive prefix match).
+
+    Supports both exact matches ("PARIS 01") and prefix searches ("Paris") that
+    aggregate across all matching sub-communes (e.g. all Paris arrondissements).
+    """
     communes = _load_communes()
     commune_lower = commune.lower()
+
+    # Exact match first
     for entry in communes:
         name = entry.get("commune", entry.get("name", ""))
         if name.lower() == commune_lower:
             return entry
-    raise HTTPException(
-        status_code=404,
-        detail=f"Commune '{commune}' introuvable.",
-    )
+
+    # Prefix match — aggregate all sub-communes (e.g. "PARIS 01"…"PARIS 20").
+    # Add trailing space to avoid false matches like "PARISOT" when searching "Paris".
+    from collections import defaultdict
+
+    prefix = commune_lower + " "
+    matches = [
+        e for e in communes
+        if e.get("commune", e.get("name", "")).lower().startswith(prefix)
+    ]
+    if not matches:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Commune '{commune}' introuvable.",
+        )
+
+    # Weighted average of prices, sum of transactions
+    total_tx = sum(e.get("nb_transactions", e.get("transactions", 0)) for e in matches)
+    if total_tx == 0:
+        total_tx = len(matches)  # avoid division by zero
+
+    def _weighted(field: str, fallback: str = "") -> float:
+        num = sum(
+            e.get(field, e.get(fallback, 0)) * e.get("nb_transactions", e.get("transactions", 1))
+            for e in matches
+        )
+        return round(num / total_tx, 0)
+
+    return {
+        "commune": commune.title(),
+        "prix_moyen_m2": _weighted("prix_moyen_m2", "avg_price_m2"),
+        "prix_median_m2": _weighted("prix_median_m2", "avg_price_m2"),
+        "nb_transactions": total_tx,
+        "sub_communes": len(matches),
+    }
+
+
+@app.get("/trends/{commune}")
+def get_commune_trends(commune: str):
+    """Return year-over-year price trends for a specific commune, grouped by property type."""
+    if not os.path.exists(_META_PATH):
+        raise HTTPException(
+            status_code=503,
+            detail="Index non construit — exécutez `python 02_vector_indexing.py` d'abord.",
+        )
+
+    try:
+        with open(_META_PATH, "r", encoding="utf-8") as fh:
+            records = json.load(fh)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur de lecture de l'index : {exc}")
+
+    commune_lower = commune.lower()
+    # Try exact match first, then prefix with trailing space to avoid false matches
+    # (e.g. "paris " matches "PARIS 01" but not "PARISOT")
+    matches = [r for r in records if r.get("commune", "").lower() == commune_lower]
+    if not matches:
+        prefix = commune_lower + " "
+        matches = [r for r in records if r.get("commune", "").lower().startswith(prefix)]
+
+    if not matches:
+        raise HTTPException(status_code=404, detail=f"Commune '{commune}' introuvable.")
+
+    # Aggregate by (annee, type_bien) — metadata has one entry per commune×type×year
+    from collections import defaultdict
+
+    buckets: dict[tuple, list] = defaultdict(list)
+    for r in matches:
+        key = (r.get("annee"), r.get("type_bien", "Tous"))
+        buckets[key].append(r)
+
+    trends = []
+    for (annee, type_bien), rows in sorted(buckets.items()):
+        avg_prix = sum(r.get("prix_moyen_m2", 0) for r in rows) / len(rows)
+        avg_med = sum(r.get("prix_median_m2", r.get("prix_moyen_m2", 0)) for r in rows) / len(rows)
+        total_tx = sum(r.get("nb_transactions", 0) for r in rows)
+        trends.append(
+            {
+                "annee": annee,
+                "type_bien": type_bien,
+                "prix_moyen_m2": round(avg_prix, 0),
+                "prix_median_m2": round(avg_med, 0),
+                "nb_transactions": total_tx,
+            }
+        )
+
+    return {"commune": commune, "trends": trends}
+
+
+@app.post("/summarize-pdf")
+async def summarize_pdf(file: UploadFile = File(...), max_length: int = 150):
+    """Summarize the text content of an uploaded PDF."""
+    try:
+        from importlib import import_module
+
+        contents = await file.read()
+        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
+            tmp.write(contents)
+            tmp_path = tmp.name
+
+        summ_mod = import_module("04_summarization")
+        result = summ_mod.summarize_pdf(tmp_path, max_length=max_length)
+
+        import os
+        os.unlink(tmp_path)
+        return result
+    except ImportError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Erreur PDF : {exc}") from exc
 
 
 @app.post("/search")
